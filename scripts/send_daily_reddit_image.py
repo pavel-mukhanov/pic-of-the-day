@@ -20,6 +20,14 @@ REDDIT_USER_AGENT = "pic-of-the-day/1.0"
 IMAGE_EXTENSIONS = (".jpg", ".jpeg", ".png", ".webp")
 
 
+class NoImageForTargetDayError(RuntimeError):
+    """Raised when there are no image posts for target day."""
+
+
+class RedditOAuthError(RuntimeError):
+    """Raised when Reddit OAuth is required but cannot be initialized."""
+
+
 def parse_subreddits(raw_value: str | None) -> list[str]:
     if not raw_value:
         return list(DEFAULT_SUBREDDITS)
@@ -79,6 +87,18 @@ def get_reddit_oauth_token(client_id: str, client_secret: str) -> str:
     return token
 
 
+def init_reddit_oauth_token() -> str | None:
+    reddit_client_id = os.getenv("REDDIT_CLIENT_ID")
+    reddit_client_secret = os.getenv("REDDIT_CLIENT_SECRET")
+    if not reddit_client_id or not reddit_client_secret:
+        return None
+
+    try:
+        return get_reddit_oauth_token(reddit_client_id, reddit_client_secret)
+    except Exception as error:  # noqa: BLE001
+        raise RedditOAuthError(str(error)) from error
+
+
 def fetch_reddit_top_posts(
     subreddit: str,
     *,
@@ -106,23 +126,63 @@ def fetch_pullpush_posts(
     after_utc: int,
     before_utc: int,
     limit: int = 200,
+    before_cursor: int | None = None,
 ) -> list[dict[str, Any]]:
-    query = urllib.parse.urlencode(
-        {
-            "subreddit": subreddit,
-            "size": limit,
-            "after": after_utc,
-            "before": before_utc,
-            "sort": "desc",
-            "sort_type": "score",
-        }
-    )
+    params: dict[str, Any] = {
+        "subreddit": subreddit,
+        "size": limit,
+        "after": after_utc,
+        "before": before_utc,
+        "sort": "desc",
+        "sort_type": "created_utc",
+    }
+    if before_cursor is not None:
+        params["before"] = before_cursor
+    query = urllib.parse.urlencode(params)
     url = f"https://api.pullpush.io/reddit/search/submission/?{query}"
     payload = fetch_json(url)
     items = payload.get("data", [])
     if not isinstance(items, list):
         return []
     return [item for item in items if isinstance(item, dict)]
+
+
+def fetch_pullpush_posts_window(
+    subreddit: str,
+    *,
+    after_utc: int,
+    before_utc: int,
+    page_size: int = 200,
+    max_pages: int = 10,
+) -> list[dict[str, Any]]:
+    all_posts: list[dict[str, Any]] = []
+    before_cursor: int | None = None
+
+    for _ in range(max_pages):
+        page = fetch_pullpush_posts(
+            subreddit=subreddit,
+            after_utc=after_utc,
+            before_utc=before_utc,
+            limit=page_size,
+            before_cursor=before_cursor,
+        )
+        if not page:
+            break
+
+        all_posts.extend(page)
+        last_created = page[-1].get("created_utc")
+        if not isinstance(last_created, (int, float)):
+            break
+
+        next_before = int(last_created)
+        if before_cursor is not None and next_before >= before_cursor:
+            break
+        before_cursor = next_before
+
+        if len(page) < page_size:
+            break
+
+    return all_posts
 
 
 def extract_image_url(post: dict[str, Any]) -> str | None:
@@ -135,11 +195,43 @@ def extract_image_url(post: dict[str, Any]) -> str | None:
     preview = post.get("preview", {})
     if isinstance(preview, dict):
         images = preview.get("images", [])
-        if images and isinstance(images[0], dict):
-            source = images[0].get("source", {})
-            preview_url = source.get("url")
-            if isinstance(preview_url, str):
-                candidates.append(preview_url)
+        for image in images:
+            if not isinstance(image, dict):
+                continue
+            for variant in ("source", "resolutions"):
+                items = image.get(variant)
+                if not isinstance(items, list):
+                    continue
+                for entry in items:
+                    if not isinstance(entry, dict):
+                        continue
+                    preview_url = entry.get("url")
+                    if isinstance(preview_url, str):
+                        candidates.append(preview_url)
+
+    if post.get("is_gallery") and isinstance(post.get("media_metadata"), dict):
+        metadata = post["media_metadata"]
+        gallery_data = post.get("gallery_data", {})
+        items = gallery_data.get("items", []) if isinstance(gallery_data, dict) else []
+        for item in items:
+            if not isinstance(item, dict):
+                continue
+            media_id = item.get("media_id")
+            if not isinstance(media_id, str):
+                continue
+            meta = metadata.get(media_id)
+            if not isinstance(meta, dict):
+                continue
+            status = meta.get("status")
+            if status not in (None, "valid"):
+                continue
+            media_type = meta.get("e")
+            if media_type == "Image":
+                source = meta.get("s", {})
+                if isinstance(source, dict):
+                    url = source.get("u")
+                    if isinstance(url, str):
+                        candidates.append(url)
 
     for raw_url in candidates:
         normalized = raw_url.replace("&amp;", "&")
@@ -194,11 +286,12 @@ def collect_candidates_pullpush(
     window_start_utc: int,
     window_end_utc: int,
 ) -> list[dict[str, Any]]:
-    posts = fetch_pullpush_posts(
+    posts = fetch_pullpush_posts_window(
         subreddit=subreddit,
         after_utc=window_start_utc,
         before_utc=window_end_utc,
-        limit=200,
+        page_size=200,
+        max_pages=10,
     )
     candidates: list[dict[str, Any]] = []
 
@@ -260,6 +353,11 @@ def choose_best_image(
                 )
             except Exception as error:  # noqa: BLE001
                 source_errors.append(f"public: {error}")
+                if "403" in str(error) or "Blocked" in str(error):
+                    source_errors.append(
+                        "hint: public Reddit is blocked; set REDDIT_CLIENT_ID/REDDIT_CLIENT_SECRET "
+                        "or rely on PullPush indexing (may lag)."
+                    )
 
         if not subreddit_candidates:
             try:
@@ -274,13 +372,12 @@ def choose_best_image(
         if subreddit_candidates:
             all_candidates.extend(subreddit_candidates)
         else:
-            if not source_errors:
-                source_errors.append("No image posts found in the target window.")
+            source_errors.append("No image posts found in the target window.")
             errors.append(f"r/{subreddit}: {'; '.join(source_errors)}")
 
     if not all_candidates:
         details = "; ".join(errors) if errors else "No image posts found in the target window."
-        raise RuntimeError(details)
+        raise NoImageForTargetDayError(details)
 
     return max(all_candidates, key=lambda item: (item["score"], item["created_utc"]))
 
@@ -350,6 +447,31 @@ def send_to_telegram(
         print(f"sendPhoto failed, fallback to sendMessage: {error}")
 
 
+def send_no_results_notice(
+    token: str,
+    chat_id: str,
+    target_day_msk: dt.date,
+    subreddits: list[str],
+    details: str,
+    dry_run: bool,
+) -> None:
+    text = (
+        f"За {target_day_msk.strftime('%d.%m.%Y')} (МСК) не найдено подходящих изображений.\n"
+        f"Сабреддиты: {', '.join(f'r/{name}' for name in subreddits)}\n\n"
+        f"Диагностика: {details}"
+    )
+    if dry_run:
+        print("DRY RUN: no-results notification prepared but not sent")
+        print(text)
+        return
+
+    telegram_api_request(
+        token=token,
+        method="sendMessage",
+        payload={"chat_id": chat_id, "text": text},
+    )
+
+
 def resolve_target_day(cli_value: str | None) -> dt.date:
     if not cli_value:
         return yesterday_moscow()
@@ -377,16 +499,12 @@ def main() -> int:
 
     token = os.getenv("TELEGRAM_BOT_TOKEN") or os.getenv("TG_BOT_TOKEN")
     chat_id = os.getenv("TELEGRAM_CHAT_ID") or os.getenv("TG_CHAT_ID")
-    reddit_client_id = os.getenv("REDDIT_CLIENT_ID")
-    reddit_client_secret = os.getenv("REDDIT_CLIENT_SECRET")
-
     oauth_token: str | None = None
-    if reddit_client_id and reddit_client_secret:
-        try:
-            oauth_token = get_reddit_oauth_token(reddit_client_id, reddit_client_secret)
-        except Exception as error:  # noqa: BLE001
-            print(f"Failed to initialize Reddit OAuth: {error}", file=sys.stderr)
-            return 1
+    try:
+        oauth_token = init_reddit_oauth_token()
+    except RedditOAuthError as error:
+        print(f"Failed to initialize Reddit OAuth: {error}", file=sys.stderr)
+        return 1
 
     if not args.dry_run and (not token or not chat_id):
         print(
@@ -403,6 +521,17 @@ def main() -> int:
             window_end_utc=window_end_utc,
             oauth_token=oauth_token,
         )
+    except NoImageForTargetDayError as error:
+        send_no_results_notice(
+            token=token or "",
+            chat_id=chat_id or "",
+            target_day_msk=target_day_msk,
+            subreddits=subreddits,
+            details=str(error),
+            dry_run=args.dry_run,
+        )
+        print("Done: no image posts found for target day.")
+        return 0
     except Exception as error:  # noqa: BLE001
         print(
             "Failed to get best image from Reddit and fallback sources.",

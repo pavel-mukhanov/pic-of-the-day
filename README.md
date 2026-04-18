@@ -13,7 +13,8 @@
   служебное сообщение в Telegram и завершает job успешно.
 - Источник данных:
   - при наличии `REDDIT_CLIENT_ID` / `REDDIT_CLIENT_SECRET` используется Reddit OAuth API;
-  - если OAuth недоступен, автоматически включается fallback на PullPush API.
+  - если OAuth недоступен, автоматически включается fallback на PullPush API
+    (с пагинацией и поддержкой preview/галерей, насколько это позволяет индекс).
 
 ## Запуск по расписанию (GitHub Actions)
 

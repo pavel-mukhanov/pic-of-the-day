@@ -1,0 +1,27 @@
+name: Daily Reddit image
+
+on:
+  schedule:
+    # 09:00 Europe/Moscow (UTC+3, no DST)
+    - cron: "0 6 * * *"
+  workflow_dispatch:
+
+jobs:
+  send-daily-image:
+    runs-on: ubuntu-latest
+    environment: news-agent
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Send yesterday best image
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          SUBREDDITS: VaporwaveAesthetics
+        run: python scripts/send_daily_reddit_image.py

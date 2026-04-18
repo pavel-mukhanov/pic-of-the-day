@@ -15,7 +15,7 @@ from typing import Any
 from zoneinfo import ZoneInfo
 
 MOSCOW_TZ = ZoneInfo("Europe/Moscow")
-DEFAULT_SUBREDDITS = ("VaporwaveAesthetics",)
+DEFAULT_SUBREDDITS = ("VaporwaveAesthetics", "pics")
 REDDIT_USER_AGENT = "pic-of-the-day/1.0"
 IMAGE_EXTENSIONS = (".jpg", ".jpeg", ".png", ".webp")
 

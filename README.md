@@ -23,6 +23,8 @@
 
 - `TELEGRAM_BOT_TOKEN` — токен Telegram-бота
 - `TELEGRAM_CHAT_ID` — chat id для отправки
+- `REDDIT_CLIENT_ID` — client id Reddit app (script)
+- `REDDIT_CLIENT_SECRET` — client secret Reddit app
 
 Переменная (опционально):
 

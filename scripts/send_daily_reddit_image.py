@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import base64
 import datetime as dt
 import json
 import os
@@ -38,14 +39,62 @@ def yesterday_moscow() -> dt.date:
     return now_moscow.date() - dt.timedelta(days=1)
 
 
-def fetch_reddit_top_posts(subreddit: str, period: str = "week", limit: int = 100) -> list[dict[str, Any]]:
-    url = (
-        f"https://www.reddit.com/r/{urllib.parse.quote(subreddit, safe='')}/top.json"
-        f"?t={period}&limit={limit}"
+def fetch_json(
+    url: str,
+    *,
+    method: str = "GET",
+    data: bytes | None = None,
+    headers: dict[str, str] | None = None,
+) -> dict[str, Any]:
+    request_headers = {"User-Agent": REDDIT_USER_AGENT}
+    if headers:
+        request_headers.update(headers)
+    request = urllib.request.Request(
+        url,
+        data=data,
+        method=method,
+        headers=request_headers,
     )
-    request = urllib.request.Request(url, headers={"User-Agent": REDDIT_USER_AGENT})
     with urllib.request.urlopen(request, timeout=30) as response:
-        payload = json.load(response)
+        return json.load(response)
+
+
+def get_reddit_oauth_token(client_id: str, client_secret: str) -> str:
+    encoded_credentials = base64.b64encode(f"{client_id}:{client_secret}".encode("utf-8")).decode(
+        "ascii"
+    )
+    payload = urllib.parse.urlencode({"grant_type": "client_credentials"}).encode("ascii")
+    result = fetch_json(
+        "https://www.reddit.com/api/v1/access_token",
+        method="POST",
+        data=payload,
+        headers={
+            "Authorization": f"Basic {encoded_credentials}",
+            "Content-Type": "application/x-www-form-urlencoded",
+        },
+    )
+    token = result.get("access_token")
+    if not isinstance(token, str) or not token:
+        raise RuntimeError("Failed to get Reddit OAuth token.")
+    return token
+
+
+def fetch_reddit_top_posts(
+    subreddit: str,
+    *,
+    oauth_token: str | None,
+    period: str = "week",
+    limit: int = 100,
+) -> list[dict[str, Any]]:
+    encoded_subreddit = urllib.parse.quote(subreddit, safe="")
+    query = urllib.parse.urlencode({"t": period, "limit": limit, "raw_json": 1})
+
+    if oauth_token:
+        url = f"https://oauth.reddit.com/r/{encoded_subreddit}/top?{query}"
+        payload = fetch_json(url, headers={"Authorization": f"Bearer {oauth_token}"})
+    else:
+        url = f"https://www.reddit.com/r/{encoded_subreddit}/top.json?{query}"
+        payload = fetch_json(url)
 
     children = payload.get("data", {}).get("children", [])
     return [item.get("data", {}) for item in children if isinstance(item, dict)]
@@ -80,8 +129,14 @@ def collect_candidates(
     subreddit: str,
     window_start_utc: int,
     window_end_utc: int,
+    oauth_token: str | None,
 ) -> list[dict[str, Any]]:
-    posts = fetch_reddit_top_posts(subreddit=subreddit, period="week", limit=100)
+    posts = fetch_reddit_top_posts(
+        subreddit=subreddit,
+        oauth_token=oauth_token,
+        period="week",
+        limit=100,
+    )
     candidates: list[dict[str, Any]] = []
 
     for post in posts:
@@ -113,6 +168,7 @@ def choose_best_image(
     subreddits: list[str],
     window_start_utc: int,
     window_end_utc: int,
+    oauth_token: str | None,
 ) -> dict[str, Any]:
     all_candidates: list[dict[str, Any]] = []
     errors: list[str] = []
@@ -124,6 +180,7 @@ def choose_best_image(
                     subreddit=subreddit,
                     window_start_utc=window_start_utc,
                     window_end_utc=window_end_utc,
+                    oauth_token=oauth_token,
                 )
             )
         except Exception as error:  # noqa: BLE001
@@ -228,6 +285,16 @@ def main() -> int:
 
     token = os.getenv("TELEGRAM_BOT_TOKEN") or os.getenv("TG_BOT_TOKEN")
     chat_id = os.getenv("TELEGRAM_CHAT_ID") or os.getenv("TG_CHAT_ID")
+    reddit_client_id = os.getenv("REDDIT_CLIENT_ID")
+    reddit_client_secret = os.getenv("REDDIT_CLIENT_SECRET")
+
+    oauth_token: str | None = None
+    if reddit_client_id and reddit_client_secret:
+        try:
+            oauth_token = get_reddit_oauth_token(reddit_client_id, reddit_client_secret)
+        except Exception as error:  # noqa: BLE001
+            print(f"Failed to initialize Reddit OAuth: {error}", file=sys.stderr)
+            return 1
 
     if not args.dry_run and (not token or not chat_id):
         print(
@@ -242,9 +309,16 @@ def main() -> int:
             subreddits=subreddits,
             window_start_utc=window_start_utc,
             window_end_utc=window_end_utc,
+            oauth_token=oauth_token,
         )
     except Exception as error:  # noqa: BLE001
-        print(f"Failed to get best image: {error}", file=sys.stderr)
+        if not oauth_token:
+            print(
+                "Failed to get best image. Public Reddit access may be blocked in CI/network. "
+                "Set REDDIT_CLIENT_ID and REDDIT_CLIENT_SECRET in environment 'news-agent'.",
+                file=sys.stderr,
+            )
+        print(f"Details: {error}", file=sys.stderr)
         return 1
 
     send_to_telegram(

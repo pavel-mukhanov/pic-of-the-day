@@ -20,6 +20,10 @@ REDDIT_USER_AGENT = "pic-of-the-day/1.0"
 IMAGE_EXTENSIONS = (".jpg", ".jpeg", ".png", ".webp")
 
 
+class NoImageForTargetDayError(RuntimeError):
+    """Raised when there are no image posts for target day."""
+
+
 def parse_subreddits(raw_value: str | None) -> list[str]:
     if not raw_value:
         return list(DEFAULT_SUBREDDITS)
@@ -274,13 +278,12 @@ def choose_best_image(
         if subreddit_candidates:
             all_candidates.extend(subreddit_candidates)
         else:
-            if not source_errors:
-                source_errors.append("No image posts found in the target window.")
+            source_errors.append("No image posts found in the target window.")
             errors.append(f"r/{subreddit}: {'; '.join(source_errors)}")
 
     if not all_candidates:
         details = "; ".join(errors) if errors else "No image posts found in the target window."
-        raise RuntimeError(details)
+        raise NoImageForTargetDayError(details)
 
     return max(all_candidates, key=lambda item: (item["score"], item["created_utc"]))
 
@@ -350,6 +353,31 @@ def send_to_telegram(
         print(f"sendPhoto failed, fallback to sendMessage: {error}")
 
 
+def send_no_results_notice(
+    token: str,
+    chat_id: str,
+    target_day_msk: dt.date,
+    subreddits: list[str],
+    details: str,
+    dry_run: bool,
+) -> None:
+    text = (
+        f"За {target_day_msk.strftime('%d.%m.%Y')} (МСК) не найдено подходящих изображений.\n"
+        f"Сабреддиты: {', '.join(f'r/{name}' for name in subreddits)}\n\n"
+        f"Диагностика: {details}"
+    )
+    if dry_run:
+        print("DRY RUN: no-results notification prepared but not sent")
+        print(text)
+        return
+
+    telegram_api_request(
+        token=token,
+        method="sendMessage",
+        payload={"chat_id": chat_id, "text": text},
+    )
+
+
 def resolve_target_day(cli_value: str | None) -> dt.date:
     if not cli_value:
         return yesterday_moscow()
@@ -403,6 +431,17 @@ def main() -> int:
             window_end_utc=window_end_utc,
             oauth_token=oauth_token,
         )
+    except NoImageForTargetDayError as error:
+        send_no_results_notice(
+            token=token or "",
+            chat_id=chat_id or "",
+            target_day_msk=target_day_msk,
+            subreddits=subreddits,
+            details=str(error),
+            dry_run=args.dry_run,
+        )
+        print("Done: no image posts found for target day.")
+        return 0
     except Exception as error:  # noqa: BLE001
         print(
             "Failed to get best image from Reddit and fallback sources.",

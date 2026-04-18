@@ -25,5 +25,5 @@ jobs:
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
           REDDIT_CLIENT_ID: ${{ secrets.REDDIT_CLIENT_ID }}
           REDDIT_CLIENT_SECRET: ${{ secrets.REDDIT_CLIENT_SECRET }}
-          SUBREDDITS: VaporwaveAesthetics
+          SUBREDDITS: VaporwaveAesthetics,pics
         run: python scripts/send_daily_reddit_image.py

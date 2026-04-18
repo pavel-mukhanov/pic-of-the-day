@@ -100,6 +100,31 @@ def fetch_reddit_top_posts(
     return [item.get("data", {}) for item in children if isinstance(item, dict)]
 
 
+def fetch_pullpush_posts(
+    subreddit: str,
+    *,
+    after_utc: int,
+    before_utc: int,
+    limit: int = 200,
+) -> list[dict[str, Any]]:
+    query = urllib.parse.urlencode(
+        {
+            "subreddit": subreddit,
+            "size": limit,
+            "after": after_utc,
+            "before": before_utc,
+            "sort": "desc",
+            "sort_type": "score",
+        }
+    )
+    url = f"https://api.pullpush.io/reddit/search/submission/?{query}"
+    payload = fetch_json(url)
+    items = payload.get("data", [])
+    if not isinstance(items, list):
+        return []
+    return [item for item in items if isinstance(item, dict)]
+
+
 def extract_image_url(post: dict[str, Any]) -> str | None:
     candidates: list[str] = []
     for key in ("url_overridden_by_dest", "url"):
@@ -164,6 +189,44 @@ def collect_candidates(
     return candidates
 
 
+def collect_candidates_pullpush(
+    subreddit: str,
+    window_start_utc: int,
+    window_end_utc: int,
+) -> list[dict[str, Any]]:
+    posts = fetch_pullpush_posts(
+        subreddit=subreddit,
+        after_utc=window_start_utc,
+        before_utc=window_end_utc,
+        limit=200,
+    )
+    candidates: list[dict[str, Any]] = []
+
+    for post in posts:
+        created_utc = int(post.get("created_utc", 0))
+        if not (window_start_utc <= created_utc < window_end_utc):
+            continue
+
+        image_url = extract_image_url(post)
+        if not image_url:
+            continue
+
+        permalink = post.get("permalink", "")
+        full_permalink = f"https://reddit.com{permalink}" if permalink else ""
+        candidates.append(
+            {
+                "subreddit": subreddit,
+                "title": str(post.get("title", "Untitled")),
+                "score": int(post.get("score", 0)),
+                "created_utc": created_utc,
+                "image_url": image_url,
+                "permalink": full_permalink,
+            }
+        )
+
+    return candidates
+
+
 def choose_best_image(
     subreddits: list[str],
     window_start_utc: int,
@@ -174,17 +237,46 @@ def choose_best_image(
     errors: list[str] = []
 
     for subreddit in subreddits:
-        try:
-            all_candidates.extend(
-                collect_candidates(
+        source_errors: list[str] = []
+        subreddit_candidates: list[dict[str, Any]] = []
+
+        if oauth_token:
+            try:
+                subreddit_candidates = collect_candidates(
                     subreddit=subreddit,
                     window_start_utc=window_start_utc,
                     window_end_utc=window_end_utc,
                     oauth_token=oauth_token,
                 )
-            )
-        except Exception as error:  # noqa: BLE001
-            errors.append(f"r/{subreddit}: {error}")
+            except Exception as error:  # noqa: BLE001
+                source_errors.append(f"oauth: {error}")
+        else:
+            try:
+                subreddit_candidates = collect_candidates(
+                    subreddit=subreddit,
+                    window_start_utc=window_start_utc,
+                    window_end_utc=window_end_utc,
+                    oauth_token=None,
+                )
+            except Exception as error:  # noqa: BLE001
+                source_errors.append(f"public: {error}")
+
+        if not subreddit_candidates:
+            try:
+                subreddit_candidates = collect_candidates_pullpush(
+                    subreddit=subreddit,
+                    window_start_utc=window_start_utc,
+                    window_end_utc=window_end_utc,
+                )
+            except Exception as error:  # noqa: BLE001
+                source_errors.append(f"pullpush: {error}")
+
+        if subreddit_candidates:
+            all_candidates.extend(subreddit_candidates)
+        else:
+            if not source_errors:
+                source_errors.append("No image posts found in the target window.")
+            errors.append(f"r/{subreddit}: {'; '.join(source_errors)}")
 
     if not all_candidates:
         details = "; ".join(errors) if errors else "No image posts found in the target window."
@@ -312,12 +404,10 @@ def main() -> int:
             oauth_token=oauth_token,
         )
     except Exception as error:  # noqa: BLE001
-        if not oauth_token:
-            print(
-                "Failed to get best image. Public Reddit access may be blocked in CI/network. "
-                "Set REDDIT_CLIENT_ID and REDDIT_CLIENT_SECRET in environment 'news-agent'.",
-                file=sys.stderr,
-            )
+        print(
+            "Failed to get best image from Reddit and fallback sources.",
+            file=sys.stderr,
+        )
         print(f"Details: {error}", file=sys.stderr)
         return 1
 

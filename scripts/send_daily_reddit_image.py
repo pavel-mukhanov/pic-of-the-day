@@ -353,11 +353,6 @@ def choose_best_image(
                 )
             except Exception as error:  # noqa: BLE001
                 source_errors.append(f"public: {error}")
-                if "403" in str(error) or "Blocked" in str(error):
-                    source_errors.append(
-                        "hint: public Reddit is blocked; set REDDIT_CLIENT_ID/REDDIT_CLIENT_SECRET "
-                        "or rely on PullPush indexing (may lag)."
-                    )
 
         if not subreddit_candidates:
             try:
@@ -377,6 +372,11 @@ def choose_best_image(
 
     if not all_candidates:
         details = "; ".join(errors) if errors else "No image posts found in the target window."
+        if not oauth_token and ("403" in details or "Blocked" in details):
+            details += (
+                " | Note: set REDDIT_CLIENT_ID and REDDIT_CLIENT_SECRET in GitHub environment "
+                "'news-agent' for reliable API access; PullPush may lag behind 'yesterday'."
+            )
         raise NoImageForTargetDayError(details)
 
     return max(all_candidates, key=lambda item: (item["score"], item["created_utc"]))
@@ -447,18 +447,37 @@ def send_to_telegram(
         print(f"sendPhoto failed, fallback to sendMessage: {error}")
 
 
+def no_results_user_hint(details: str, *, has_oauth: bool) -> str:
+    if not has_oauth and ("403" in details or "Blocked" in details):
+        return (
+            "Публичный Reddit из GitHub Actions часто отвечает 403. "
+            "Добавьте в environment «news-agent» секреты REDDIT_CLIENT_ID и REDDIT_CLIENT_SECRET "
+            "(script app). Пока их нет, используется только архив PullPush — за «вчера» данных может не быть."
+        )
+    if "pullpush" in details.lower():
+        return (
+            "Архив PullPush за выбранный день не вернул постов с картинкой. "
+            "Позже индекс может догнать дату, либо подключите Reddit OAuth (см. README)."
+        )
+    return "За этот день среди выбранных сабреддитов не нашлось постов с прямой ссылкой на изображение."
+
+
 def send_no_results_notice(
     token: str,
     chat_id: str,
     target_day_msk: dt.date,
     subreddits: list[str],
     details: str,
+    *,
+    has_oauth: bool,
     dry_run: bool,
 ) -> None:
+    subs = ", ".join(f"r/{name}" for name in subreddits)
+    hint = no_results_user_hint(details, has_oauth=has_oauth)
     text = (
         f"За {target_day_msk.strftime('%d.%m.%Y')} (МСК) не найдено подходящих изображений.\n"
-        f"Сабреддиты: {', '.join(f'r/{name}' for name in subreddits)}\n\n"
-        f"Диагностика: {details}"
+        f"Сабреддиты: {subs}\n\n"
+        f"{hint}"
     )
     if dry_run:
         print("DRY RUN: no-results notification prepared but not sent")
@@ -522,12 +541,15 @@ def main() -> int:
             oauth_token=oauth_token,
         )
     except NoImageForTargetDayError as error:
+        print("No image for target day — full diagnostic:", file=sys.stderr)
+        print(str(error), file=sys.stderr)
         send_no_results_notice(
             token=token or "",
             chat_id=chat_id or "",
             target_day_msk=target_day_msk,
             subreddits=subreddits,
             details=str(error),
+            has_oauth=oauth_token is not None,
             dry_run=args.dry_run,
         )
         print("Done: no image posts found for target day.")

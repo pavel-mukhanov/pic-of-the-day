@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Send the best Reddit image from yesterday to Telegram."""
+"""Send a daily image to Telegram: from Reddit subreddits or from web image search (Openverse)."""
 
 from __future__ import annotations
 
@@ -16,16 +16,17 @@ from zoneinfo import ZoneInfo
 
 MOSCOW_TZ = ZoneInfo("Europe/Moscow")
 DEFAULT_SUBREDDITS = ("VaporwaveAesthetics", "pics")
-REDDIT_USER_AGENT = "pic-of-the-day/1.0"
+HTTP_USER_AGENT = "pic-of-the-day/1.0 (+https://github.com/pavel-mukhanov/pic-of-the-day)"
 IMAGE_EXTENSIONS = (".jpg", ".jpeg", ".png", ".webp")
+DEFAULT_COMMONS_QUERY = "vaporwave aesthetic"
 
 
 class NoImageForTargetDayError(RuntimeError):
-    """Raised when there are no image posts for target day."""
+    """Raised when there are no suitable images for the run."""
 
 
 class RedditOAuthError(RuntimeError):
-    """Raised when Reddit OAuth is required but cannot be initialized."""
+    """Raised when Reddit OAuth is configured but cannot be initialized."""
 
 
 def parse_subreddits(raw_value: str | None) -> list[str]:
@@ -34,6 +35,14 @@ def parse_subreddits(raw_value: str | None) -> list[str]:
 
     names = [item.strip() for item in raw_value.split(",")]
     return [name for name in names if name]
+
+
+def image_source_mode() -> str:
+    raw = (os.getenv("IMAGE_SOURCE") or "reddit").strip().lower()
+    # "web" / legacy openverse aliases → Wikimedia Commons search (no API keys).
+    if raw in ("commons", "web", "search", "wikimedia", "openverse", "openverse_search"):
+        return "commons"
+    return "reddit"
 
 
 def target_day_window_utc(target_day_msk: dt.date) -> tuple[int, int]:
@@ -54,7 +63,7 @@ def fetch_json(
     data: bytes | None = None,
     headers: dict[str, str] | None = None,
 ) -> dict[str, Any]:
-    request_headers = {"User-Agent": REDDIT_USER_AGENT}
+    request_headers = {"User-Agent": HTTP_USER_AGENT}
     if headers:
         request_headers.update(headers)
     request = urllib.request.Request(
@@ -269,6 +278,7 @@ def collect_candidates(
         full_permalink = f"https://reddit.com{permalink}" if permalink else ""
         candidates.append(
             {
+                "kind": "reddit",
                 "subreddit": subreddit,
                 "title": str(post.get("title", "Untitled")),
                 "score": int(post.get("score", 0)),
@@ -308,6 +318,7 @@ def collect_candidates_pullpush(
         full_permalink = f"https://reddit.com{permalink}" if permalink else ""
         candidates.append(
             {
+                "kind": "reddit",
                 "subreddit": subreddit,
                 "title": str(post.get("title", "Untitled")),
                 "score": int(post.get("score", 0)),
@@ -374,12 +385,91 @@ def choose_best_image(
         details = "; ".join(errors) if errors else "No image posts found in the target window."
         if not oauth_token and ("403" in details or "Blocked" in details):
             details += (
-                " | Note: set REDDIT_CLIENT_ID and REDDIT_CLIENT_SECRET in GitHub environment "
-                "'news-agent' for reliable API access; PullPush may lag behind 'yesterday'."
+                " | Note: public Reddit is often blocked from CI; use Reddit OAuth secrets "
+                "or set IMAGE_SOURCE=commons for web image search without Reddit."
             )
         raise NoImageForTargetDayError(details)
 
     return max(all_candidates, key=lambda item: (item["score"], item["created_utc"]))
+
+
+def fetch_commons_file_pages(query: str, *, limit: int = 24) -> list[dict[str, Any]]:
+    """Search Wikimedia Commons file namespace; returns page dicts with imageinfo."""
+    params = urllib.parse.urlencode(
+        {
+            "action": "query",
+            "generator": "search",
+            "gsrsearch": query,
+            "gsrnamespace": "6",
+            "gsrlimit": str(limit),
+            "prop": "imageinfo",
+            "iiprop": "url|mime|size|dimensions",
+            "format": "json",
+            "formatversion": "2",
+        }
+    )
+    url = f"https://commons.wikimedia.org/w/api.php?{params}"
+    payload = fetch_json(url)
+    pages = payload.get("query", {}).get("pages", [])
+    if not isinstance(pages, list):
+        return []
+    return [page for page in pages if isinstance(page, dict)]
+
+
+def choose_best_commons_image(query: str) -> dict[str, Any]:
+    pages = fetch_commons_file_pages(query, limit=24)
+    candidates: list[dict[str, Any]] = []
+
+    for page in pages:
+        title = str(page.get("title", ""))
+        if not title.startswith("File:"):
+            continue
+        imageinfo = page.get("imageinfo")
+        if not isinstance(imageinfo, list) or not imageinfo:
+            continue
+        info = imageinfo[0]
+        if not isinstance(info, dict):
+            continue
+        mime = info.get("mime", "")
+        if not isinstance(mime, str) or not mime.startswith("image/"):
+            continue
+        if mime == "image/svg+xml":
+            continue
+
+        url = info.get("url")
+        if not isinstance(url, str) or not url.startswith("http"):
+            continue
+        lowered = url.lower().split("?", 1)[0]
+        if not lowered.endswith(IMAGE_EXTENSIONS):
+            continue
+
+        width = info.get("width")
+        height = info.get("height")
+        w = int(width) if isinstance(width, (int, float)) else 0
+        h = int(height) if isinstance(height, (int, float)) else 0
+        page_url = info.get("descriptionurl", "")
+        page_url_str = str(page_url) if isinstance(page_url, str) else ""
+
+        display_title = title.removeprefix("File:").replace("_", " ")
+
+        candidates.append(
+            {
+                "kind": "commons",
+                "search_query": query,
+                "title": display_title,
+                "image_url": url,
+                "permalink": page_url_str,
+                "attribution": "Wikimedia Commons — проверьте лицензию на странице файла.",
+                "license": "см. страницу файла на Commons",
+                "score": w * h,
+                "created_utc": 0,
+            }
+        )
+
+    if not candidates:
+        raise NoImageForTargetDayError(f"commons: no image results for query {query!r}")
+
+    return max(candidates, key=lambda item: (item["score"], len(item["title"])))
 
 
 def telegram_api_request(token: str, method: str, payload: dict[str, Any]) -> dict[str, Any]:
@@ -400,6 +490,23 @@ def telegram_api_request(token: str, method: str, payload: dict[str, Any]) -> di
 
 
 def build_caption(item: dict[str, Any], target_day_msk: dt.date) -> str:
+    if item.get("kind") == "commons":
+        lines = [
+            f"Картинка дня за {target_day_msk.strftime('%d.%m.%Y')} (МСК)",
+            f"Поиск (Wikimedia Commons): {item.get('search_query', '')}",
+            "",
+            item.get("title", "Untitled"),
+        ]
+        if item.get("license"):
+            lines.append("")
+            lines.append(f"Лицензия: {item['license']}")
+        if item.get("attribution"):
+            lines.append("")
+            lines.append(item["attribution"])
+        if item.get("permalink"):
+            lines.extend(["", item["permalink"]])
+        return "\n".join(lines)
+
     lines = [
         f"Лучшее изображение за {target_day_msk.strftime('%d.%m.%Y')} (МСК)",
         f"Сабреддит: r/{item['subreddit']}",
@@ -407,7 +514,7 @@ def build_caption(item: dict[str, Any], target_day_msk: dt.date) -> str:
         "",
         item["title"],
     ]
-    if item["permalink"]:
+    if item.get("permalink"):
         lines.extend(["", item["permalink"]])
     return "\n".join(lines)
 
@@ -447,17 +554,21 @@ def send_to_telegram(
         print(f"sendPhoto failed, fallback to sendMessage: {error}")
 
 
-def no_results_user_hint(details: str, *, has_oauth: bool) -> str:
+def no_results_user_hint(details: str, *, has_oauth: bool, source_mode: str) -> str:
+    if source_mode == "commons":
+        return (
+            "По запросу в Wikimedia Commons не нашлось подходящего изображения (JPG/PNG/WebP). "
+            "Попробуйте изменить переменную IMAGE_SEARCH_QUERY."
+        )
     if not has_oauth and ("403" in details or "Blocked" in details):
         return (
             "Публичный Reddit из GitHub Actions часто отвечает 403. "
-            "Добавьте в environment «news-agent» секреты REDDIT_CLIENT_ID и REDDIT_CLIENT_SECRET "
-            "(script app). Пока их нет, используется только архив PullPush — за «вчера» данных может не быть."
+            "Варианты: секреты Reddit OAuth, или режим IMAGE_SOURCE=commons (поиск на Wikimedia Commons)."
         )
     if "pullpush" in details.lower():
         return (
             "Архив PullPush за выбранный день не вернул постов с картинкой. "
-            "Позже индекс может догнать дату, либо подключите Reddit OAuth (см. README)."
+            "Позже индекс может догнать дату, либо используйте IMAGE_SOURCE=commons."
         )
     return "За этот день среди выбранных сабреддитов не нашлось постов с прямой ссылкой на изображение."
 
@@ -470,15 +581,22 @@ def send_no_results_notice(
     details: str,
     *,
     has_oauth: bool,
+    source_mode: str,
     dry_run: bool,
 ) -> None:
     subs = ", ".join(f"r/{name}" for name in subreddits)
-    hint = no_results_user_hint(details, has_oauth=has_oauth)
-    text = (
-        f"За {target_day_msk.strftime('%d.%m.%Y')} (МСК) не найдено подходящих изображений.\n"
-        f"Сабреддиты: {subs}\n\n"
-        f"{hint}"
-    )
+    hint = no_results_user_hint(details, has_oauth=has_oauth, source_mode=source_mode)
+    if source_mode == "commons":
+        text = (
+            f"За {target_day_msk.strftime('%d.%m.%Y')} (МСК) не удалось подобрать картинку.\n\n"
+            f"{hint}"
+        )
+    else:
+        text = (
+            f"За {target_day_msk.strftime('%d.%m.%Y')} (МСК) не найдено подходящих изображений.\n"
+            f"Сабреддиты: {subs}\n\n"
+            f"{hint}"
+        )
     if dry_run:
         print("DRY RUN: no-results notification prepared but not sent")
         print(text)
@@ -499,7 +617,7 @@ def resolve_target_day(cli_value: str | None) -> dt.date:
 
 def main() -> int:
     parser = argparse.ArgumentParser(
-        description="Send yesterday's top Reddit image to Telegram."
+        description="Send a daily image to Telegram (Reddit subreddits or Commons web search)."
     )
     parser.add_argument(
         "--dry-run",
@@ -508,22 +626,25 @@ def main() -> int:
     )
     parser.add_argument(
         "--target-date",
-        help="Target day in Moscow timezone (YYYY-MM-DD). Defaults to yesterday.",
+        help="Label date in Moscow timezone (YYYY-MM-DD). Defaults to yesterday.",
     )
     args = parser.parse_args()
 
     target_day_msk = resolve_target_day(args.target_date)
     window_start_utc, window_end_utc = target_day_window_utc(target_day_msk)
     subreddits = parse_subreddits(os.getenv("SUBREDDITS"))
+    source_mode = image_source_mode()
 
     token = os.getenv("TELEGRAM_BOT_TOKEN") or os.getenv("TG_BOT_TOKEN")
     chat_id = os.getenv("TELEGRAM_CHAT_ID") or os.getenv("TG_CHAT_ID")
+
     oauth_token: str | None = None
-    try:
-        oauth_token = init_reddit_oauth_token()
-    except RedditOAuthError as error:
-        print(f"Failed to initialize Reddit OAuth: {error}", file=sys.stderr)
-        return 1
+    if source_mode == "reddit":
+        try:
+            oauth_token = init_reddit_oauth_token()
+        except RedditOAuthError as error:
+            print(f"Failed to initialize Reddit OAuth: {error}", file=sys.stderr)
+            return 1
 
     if not args.dry_run and (not token or not chat_id):
         print(
@@ -533,15 +654,20 @@ def main() -> int:
         )
         return 2
 
+    best_item: dict[str, Any] | None = None
     try:
-        best_item = choose_best_image(
-            subreddits=subreddits,
-            window_start_utc=window_start_utc,
-            window_end_utc=window_end_utc,
-            oauth_token=oauth_token,
-        )
+        if source_mode == "commons":
+            query = (os.getenv("IMAGE_SEARCH_QUERY") or "").strip() or DEFAULT_COMMONS_QUERY
+            best_item = choose_best_commons_image(query)
+        else:
+            best_item = choose_best_image(
+                subreddits=subreddits,
+                window_start_utc=window_start_utc,
+                window_end_utc=window_end_utc,
+                oauth_token=oauth_token,
+            )
     except NoImageForTargetDayError as error:
-        print("No image for target day — full diagnostic:", file=sys.stderr)
+        print("No image for this run — full diagnostic:", file=sys.stderr)
         print(str(error), file=sys.stderr)
         send_no_results_notice(
             token=token or "",
@@ -550,16 +676,18 @@ def main() -> int:
             subreddits=subreddits,
             details=str(error),
             has_oauth=oauth_token is not None,
+            source_mode=source_mode,
             dry_run=args.dry_run,
         )
-        print("Done: no image posts found for target day.")
+        print("Done: no suitable image found.")
         return 0
     except Exception as error:  # noqa: BLE001
-        print(
-            "Failed to get best image from Reddit and fallback sources.",
-            file=sys.stderr,
-        )
+        print("Failed to get an image.", file=sys.stderr)
         print(f"Details: {error}", file=sys.stderr)
+        return 1
+
+    if best_item is None:
+        print("Internal error: no item selected.", file=sys.stderr)
         return 1
 
     send_to_telegram(
@@ -569,10 +697,13 @@ def main() -> int:
         target_day_msk=target_day_msk,
         dry_run=args.dry_run,
     )
-    print(
-        "Done:"
-        f" r/{best_item['subreddit']} | score={best_item['score']} | {best_item['image_url']}"
-    )
+    if best_item.get("kind") == "commons":
+        print(f"Done: commons | {best_item['image_url']}")
+    else:
+        print(
+            "Done:"
+            f" r/{best_item['subreddit']} | score={best_item['score']} | {best_item['image_url']}"
+        )
     return 0
 
 

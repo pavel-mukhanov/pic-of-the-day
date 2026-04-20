@@ -1,50 +1,77 @@
 # pic-of-the-day
 
-Сервис отправляет в Telegram лучшую картинку за прошлый день из Reddit.
-По умолчанию используются сабреддиты: `r/VaporwaveAesthetics`, `r/pics`.
+Сервис раз в день отправляет в Telegram **одну картинку**.
 
-## Как это работает
+## Режимы
 
-- Скрипт берет посты из `top` (за неделю) и фильтрует только те, что были
-  опубликованы **вчера по Москве**.
-- Из найденных image-постов выбирается лучший по `score`.
-- Результат отправляется в Telegram (фото, а при ошибке — текст + ссылка).
-- Если за выбранный день постов с картинками нет, скрипт отправляет
-  служебное сообщение в Telegram и завершает job успешно.
-- Источник данных:
-  - при наличии `REDDIT_CLIENT_ID` / `REDDIT_CLIENT_SECRET` используется Reddit OAuth API;
-  - если OAuth недоступен, автоматически включается fallback на PullPush API
-    (с пагинацией и поддержкой preview/галерей, насколько это позволяет индекс).
+### 1) Поиск по вебу (по умолчанию в GitHub Actions)
+
+`IMAGE_SOURCE=commons` — поиск файлов на **Wikimedia Commons** через публичный
+[MediaWiki API](https://commons.wikimedia.org/wiki/Commons:API). **Ключи Reddit не нужны.**
+
+- Переменная **`IMAGE_SEARCH_QUERY`** — текст поиска (например `vaporwave aesthetic photography`).
+- Берутся первые результаты в пространстве имён «файл»; отбрасываются не-картинки и SVG.
+- Среди оставшихся выбирается файл с наибольшей площадью (`width * height`), если размеры есть.
+- В подписи указывается ссылка на страницу файла на Commons — **там указана лицензия**;
+  агрегатор не подставляет юридический текст лицензии автоматически.
+
+Алиасы без ключей: `IMAGE_SOURCE=web`, `search`, `wikimedia` (и устаревшие `openverse` —
+теперь тоже ведут на Commons, т.к. публичный Openverse API стал требовать авторизацию).
+
+### 2) Reddit по сабреддитам (вчера по Москве)
+
+`IMAGE_SOURCE=reddit` (или переменная не задана).
+
+- По умолчанию сабреддиты: `VaporwaveAesthetics`, `pics` (список `SUBREDDITS` через запятую).
+- Берутся посты из `top` за неделю, фильтр по **вчерашнему календарному дню по МСК**,
+  лучший image-пост по `score`.
+- Если публичный Reddit из CI отвечает **403**, можно добавить секреты
+  `REDDIT_CLIENT_ID` / `REDDIT_CLIENT_SECRET` (OAuth), иначе используется fallback **PullPush**
+  (индекс может отставать от «вчера»).
+
+Если за день ничего не найдено, в Telegram уходит **короткое** служебное сообщение,
+job завершается успешно; полная диагностика — в логе GitHub Actions.
 
 ## Запуск по расписанию (GitHub Actions)
 
-Файл workflow: `.github/workflows/daily-reddit-image.yml`
+Файл: `.github/workflows/daily-reddit-image.yml`
 
-- Запуск каждый день в `06:00 UTC` (что соответствует `09:00 Europe/Moscow`).
-- Workflow использует `environment: news-agent`.
+- Каждый день в `06:00 UTC` (= `09:00` по Москве).
+- Environment: `news-agent`.
 
-### Что нужно настроить в environment `news-agent`
+### Секреты в `news-agent`
 
-Секреты:
+Обязательно:
 
-- `TELEGRAM_BOT_TOKEN` — токен Telegram-бота
-- `TELEGRAM_CHAT_ID` — chat id для отправки
-- `REDDIT_CLIENT_ID` — client id Reddit app (script)
-- `REDDIT_CLIENT_SECRET` — client secret Reddit app
+- `TELEGRAM_BOT_TOKEN`
+- `TELEGRAM_CHAT_ID`
 
-Переменная (опционально):
+Опционально (только для режима Reddit + OAuth):
 
-- `SUBREDDITS` — список сабреддитов через запятую
-  (по умолчанию `VaporwaveAesthetics,pics`)
+- `REDDIT_CLIENT_ID`, `REDDIT_CLIENT_SECRET`
+
+Переменные workflow / environment (примеры):
+
+- `IMAGE_SOURCE` — `commons` или `reddit`
+- `IMAGE_SEARCH_QUERY` — строка поиска для Commons
 
 ## Локальный запуск
 
+Режим Commons (без Telegram):
+
 ```bash
-python3 scripts/send_daily_reddit_image.py --dry-run
+IMAGE_SOURCE=commons IMAGE_SEARCH_QUERY="vaporwave sunset" \
+  python3 scripts/send_daily_reddit_image.py --dry-run
 ```
 
-Для принудительной даты:
+Режим Reddit:
 
 ```bash
-python3 scripts/send_daily_reddit_image.py --target-date 2026-04-17 --dry-run
+IMAGE_SOURCE=reddit python3 scripts/send_daily_reddit_image.py --dry-run
+```
+
+Дата в подписи (метка «за какой день»):
+
+```bash
+python3 scripts/send_daily_reddit_image.py --dry-run --target-date 2026-04-17
 ```

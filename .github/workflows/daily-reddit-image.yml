@@ -23,7 +23,8 @@ jobs:
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
-          # No Reddit keys: image of the day via Wikimedia Commons search API.
+          # No Reddit keys required.
+          # Available: commons | midjourney | reddit
           IMAGE_SOURCE: commons
           IMAGE_SEARCH_QUERY: vaporwave aesthetic photography
         run: python scripts/send_daily_reddit_image.py

@@ -1,11 +1,12 @@
 #!/usr/bin/env python3
-"""Send a daily image to Telegram: from Reddit subreddits or from web image search (Openverse)."""
+"""Send a daily image/video to Telegram from multiple sources."""
 
 from __future__ import annotations
 
 import argparse
 import base64
 import datetime as dt
+import html
 import json
 import os
 import sys
@@ -56,6 +57,8 @@ def image_source_mode() -> str:
     # "web" / legacy openverse aliases → Wikimedia Commons search (no API keys).
     if raw in ("commons", "web", "search", "wikimedia", "openverse", "openverse_search"):
         return "commons"
+    if raw in ("midjourney", "mj", "midjourney_gallery"):
+        return "midjourney"
     return "reddit"
 
 
@@ -572,6 +575,80 @@ def choose_commons_image_for_day(target_day_msk: dt.date, query_variants: list[s
     return collected[index]
 
 
+def fetch_text(url: str, *, headers: dict[str, str] | None = None) -> str:
+    request_headers = {"User-Agent": HTTP_USER_AGENT}
+    if headers:
+        request_headers.update(headers)
+    request = urllib.request.Request(url, headers=request_headers)
+    with urllib.request.urlopen(request, timeout=40) as response:
+        return response.read().decode("utf-8", "replace")
+
+
+def fetch_midjourney_explore_markdown() -> str:
+    # Midjourney blocks direct CI traffic; use read-only proxy fetch.
+    url = "https://r.jina.ai/http://www.midjourney.com/explore?tab=video_top"
+    return fetch_text(url)
+
+
+def parse_midjourney_candidates(markdown_text: str) -> list[dict[str, Any]]:
+    candidates: list[dict[str, Any]] = []
+    lines = markdown_text.splitlines()
+    for line in lines:
+        line = line.strip()
+        if not line.startswith("[![Image "):
+            continue
+        if "](https://cdn.midjourney.com/video/" not in line:
+            continue
+        if "](http://www.midjourney.com/jobs/" not in line:
+            continue
+        try:
+            image_part = line.split("](https://cdn.midjourney.com/video/", 1)[1]
+            image_url = "https://cdn.midjourney.com/video/" + image_part.split(")", 1)[0]
+            job_part = line.split("](http://www.midjourney.com/jobs/", 1)[1]
+            job_path = "http://www.midjourney.com/jobs/" + job_part.split(")", 1)[0]
+            job_url = job_path.replace("http://", "https://")
+        except Exception:  # noqa: BLE001
+            continue
+        image_url = image_url.split("?", 1)[0]
+        if not image_url.startswith("https://cdn.midjourney.com/video/"):
+            continue
+        if not image_url.lower().endswith(".webp"):
+            continue
+        rank_score = max(0, 10000 - len(candidates))
+        candidates.append(
+            {
+                "kind": "midjourney",
+                "title": "Midjourney video top",
+                "image_url": image_url,
+                "permalink": job_url,
+                "search_query": "midjourney explore video_top",
+                "is_animated": True,
+                "score": rank_score,
+                "created_utc": 0,
+            }
+        )
+    unique: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for item in candidates:
+        key = item["image_url"]
+        if key in seen:
+            continue
+        seen.add(key)
+        unique.append(item)
+    return unique
+
+
+def choose_midjourney_item_for_day(target_day_msk: dt.date) -> dict[str, Any]:
+    markdown_text = fetch_midjourney_explore_markdown()
+    candidates = parse_midjourney_candidates(markdown_text)
+    if not candidates:
+        raise NoImageForTargetDayError(
+            "midjourney: no accessible video preview candidates found from explore page."
+        )
+    index = target_day_msk.toordinal() % len(candidates)
+    return candidates[index]
+
+
 def telegram_api_request(token: str, method: str, payload: dict[str, Any]) -> dict[str, Any]:
     url = f"https://api.telegram.org/bot{token}/{method}"
     encoded = json.dumps(payload).encode("utf-8")
@@ -590,6 +667,17 @@ def telegram_api_request(token: str, method: str, payload: dict[str, Any]) -> di
 
 
 def build_caption(item: dict[str, Any], target_day_msk: dt.date) -> str:
+    if item.get("kind") == "midjourney":
+        lines = [
+            f"GIF дня за {target_day_msk.strftime('%d.%m.%Y')} (МСК)",
+            "Источник: Midjourney Explore (video_top)",
+            "",
+            item.get("title", "Midjourney video"),
+        ]
+        if item.get("permalink"):
+            lines.extend(["", item["permalink"]])
+        return "\n".join(lines)
+
     if item.get("kind") == "commons":
         lines = [
             f"Картинка дня за {target_day_msk.strftime('%d.%m.%Y')} (МСК)",
@@ -633,6 +721,28 @@ def send_to_telegram(
         print(item["image_url"])
         return
 
+    if item.get("is_animated"):
+        try:
+            telegram_api_request(
+                token=token,
+                method="sendAnimation",
+                payload={
+                    "chat_id": chat_id,
+                    "animation": item["image_url"],
+                    "caption": caption[:1024],
+                },
+            )
+            return
+        except Exception as error:  # noqa: BLE001
+            print(f"sendAnimation failed, fallback to sendMessage: {error}")
+            fallback_text = f"{caption}\n\n{item['image_url']}"
+            telegram_api_request(
+                token=token,
+                method="sendMessage",
+                payload={"chat_id": chat_id, "text": fallback_text},
+            )
+            return
+
     try:
         telegram_api_request(
             token=token,
@@ -655,6 +765,11 @@ def send_to_telegram(
 
 
 def no_results_user_hint(details: str, *, has_oauth: bool, source_mode: str) -> str:
+    if source_mode == "midjourney":
+        return (
+            "Не удалось получить гифки из Midjourney Explore через доступный прокси."
+            " Попробуйте позже или переключитесь на IMAGE_SOURCE=commons."
+        )
     if source_mode == "commons":
         return (
             "На выбранную дату не удалось подобрать картинку из Wikimedia Commons. "
@@ -663,12 +778,12 @@ def no_results_user_hint(details: str, *, has_oauth: bool, source_mode: str) -> 
     if not has_oauth and ("403" in details or "Blocked" in details):
         return (
             "Публичный Reddit из GitHub Actions часто отвечает 403. "
-            "Варианты: секреты Reddit OAuth, или режим IMAGE_SOURCE=commons (поиск на Wikimedia Commons)."
+            "Варианты: секреты Reddit OAuth, или режимы IMAGE_SOURCE=commons / IMAGE_SOURCE=midjourney."
         )
     if "pullpush" in details.lower():
         return (
             "Архив PullPush за выбранный день не вернул постов с картинкой. "
-            "Позже индекс может догнать дату, либо используйте IMAGE_SOURCE=commons."
+            "Позже индекс может догнать дату, либо используйте IMAGE_SOURCE=commons или midjourney."
         )
     return "За этот день среди выбранных сабреддитов не нашлось постов с прямой ссылкой на изображение."
 
@@ -686,7 +801,7 @@ def send_no_results_notice(
 ) -> None:
     subs = ", ".join(f"r/{name}" for name in subreddits)
     hint = no_results_user_hint(details, has_oauth=has_oauth, source_mode=source_mode)
-    if source_mode == "commons":
+    if source_mode in ("commons", "midjourney"):
         text = (
             f"За {target_day_msk.strftime('%d.%m.%Y')} (МСК) не удалось подобрать картинку.\n\n"
             f"{hint}"
@@ -762,6 +877,8 @@ def main() -> int:
                 target_day_msk=target_day_msk,
                 query_variants=query_variants,
             )
+        elif source_mode == "midjourney":
+            best_item = choose_midjourney_item_for_day(target_day_msk)
         else:
             best_item = choose_best_image(
                 subreddits=subreddits,
@@ -802,6 +919,8 @@ def main() -> int:
     )
     if best_item.get("kind") == "commons":
         print(f"Done: commons | {best_item['image_url']}")
+    elif best_item.get("kind") == "midjourney":
+        print(f"Done: midjourney | {best_item['image_url']}")
     else:
         print(
             "Done:"

@@ -11,6 +11,7 @@ import os
 import sys
 import urllib.parse
 import urllib.request
+import xml.etree.ElementTree as ET
 from typing import Any
 from zoneinfo import ZoneInfo
 
@@ -18,7 +19,13 @@ MOSCOW_TZ = ZoneInfo("Europe/Moscow")
 DEFAULT_SUBREDDITS = ("VaporwaveAesthetics", "pics")
 HTTP_USER_AGENT = "pic-of-the-day/1.0 (+https://github.com/pavel-mukhanov/pic-of-the-day)"
 IMAGE_EXTENSIONS = (".jpg", ".jpeg", ".png", ".webp")
-DEFAULT_COMMONS_QUERY = "vaporwave aesthetic"
+DEFAULT_COMMONS_QUERY_VARIANTS = (
+    "vaporwave aesthetic",
+    "vaporwave city night",
+    "retro wave neon",
+    "synthwave sunset",
+    "outrun neon",
+)
 
 
 class NoImageForTargetDayError(RuntimeError):
@@ -35,6 +42,13 @@ def parse_subreddits(raw_value: str | None) -> list[str]:
 
     names = [item.strip() for item in raw_value.split(",")]
     return [name for name in names if name]
+
+
+def parse_query_variants(raw_value: str | None) -> list[str]:
+    if not raw_value:
+        return list(DEFAULT_COMMONS_QUERY_VARIANTS)
+    variants = [item.strip() for item in raw_value.split("|")]
+    return [variant for variant in variants if variant]
 
 
 def image_source_mode() -> str:
@@ -393,7 +407,7 @@ def choose_best_image(
     return max(all_candidates, key=lambda item: (item["score"], item["created_utc"]))
 
 
-def fetch_commons_file_pages(query: str, *, limit: int = 24) -> list[dict[str, Any]]:
+def fetch_commons_file_pages(query: str, *, limit: int = 24, offset: int = 0) -> list[dict[str, Any]]:
     """Search Wikimedia Commons file namespace; returns page dicts with imageinfo."""
     params = urllib.parse.urlencode(
         {
@@ -402,6 +416,7 @@ def fetch_commons_file_pages(query: str, *, limit: int = 24) -> list[dict[str, A
             "gsrsearch": query,
             "gsrnamespace": "6",
             "gsrlimit": str(limit),
+            "gsroffset": str(offset),
             "prop": "imageinfo",
             "iiprop": "url|mime|size|dimensions",
             "format": "json",
@@ -416,8 +431,68 @@ def fetch_commons_file_pages(query: str, *, limit: int = 24) -> list[dict[str, A
     return [page for page in pages if isinstance(page, dict)]
 
 
-def choose_best_commons_image(query: str) -> dict[str, Any]:
-    pages = fetch_commons_file_pages(query, limit=24)
+def fetch_commons_potd(target_day_msk: dt.date) -> dict[str, Any] | None:
+    params = urllib.parse.urlencode(
+        {
+            "action": "featuredfeed",
+            "feed": "potd",
+            "feedformat": "atom",
+            "language": "en",
+            "year": str(target_day_msk.year),
+            "month": f"{target_day_msk.month:02d}",
+            "day": f"{target_day_msk.day:02d}",
+        }
+    )
+    url = f"https://commons.wikimedia.org/w/api.php?{params}"
+    request = urllib.request.Request(url, headers={"User-Agent": HTTP_USER_AGENT})
+    with urllib.request.urlopen(request, timeout=30) as response:
+        xml_text = response.read().decode("utf-8", "replace")
+
+    root = ET.fromstring(xml_text)
+    atom_ns = "{http://www.w3.org/2005/Atom}"
+    media_ns = "{http://search.yahoo.com/mrss/}"
+
+    entry = root.find(f"{atom_ns}entry")
+    if entry is None:
+        return None
+
+    title_node = entry.find(f"{atom_ns}title")
+    title = title_node.text.strip() if title_node is not None and title_node.text else "Picture of the day"
+
+    page_link = ""
+    for link in entry.findall(f"{atom_ns}link"):
+        href = link.attrib.get("href", "")
+        rel = link.attrib.get("rel", "")
+        if href and rel in ("alternate", ""):
+            page_link = href
+            break
+
+    content_node = entry.find(f"{media_ns}content")
+    image_url = content_node.attrib.get("url", "") if content_node is not None else ""
+    if not image_url.startswith("http"):
+        return None
+
+    lowered = image_url.lower().split("?", 1)[0]
+    if not lowered.endswith(IMAGE_EXTENSIONS):
+        return None
+
+    return {
+        "kind": "commons",
+        "search_query": "Wikimedia Commons Picture of the Day",
+        "title": title,
+        "image_url": image_url,
+        "permalink": page_link,
+        "attribution": "Wikimedia Commons — проверьте лицензию на странице файла.",
+        "license": "см. страницу файла на Commons",
+        "score": 0,
+        "created_utc": 0,
+    }
+
+
+def choose_best_commons_image(query: str, target_day_msk: dt.date) -> dict[str, Any]:
+    pages: list[dict[str, Any]] = []
+    for offset in (0, 24, 48):
+        pages.extend(fetch_commons_file_pages(query, limit=24, offset=offset))
     candidates: list[dict[str, Any]] = []
 
     for page in pages:
@@ -468,8 +543,33 @@ def choose_best_commons_image(query: str) -> dict[str, Any]:
 
     if not candidates:
         raise NoImageForTargetDayError(f"commons: no image results for query {query!r}")
+    # Rotate within top candidates by date so neighboring days are not identical.
+    ranked = sorted(candidates, key=lambda item: (item["score"], len(item["title"])), reverse=True)
+    pool_size = min(len(ranked), 7)
+    index = target_day_msk.toordinal() % pool_size
+    return ranked[index]
 
-    return max(candidates, key=lambda item: (item["score"], len(item["title"])))
+
+def choose_commons_image_for_day(target_day_msk: dt.date, query_variants: list[str]) -> dict[str, Any]:
+    if not query_variants:
+        query_variants = list(DEFAULT_COMMONS_QUERY_VARIANTS)
+
+    collected: list[dict[str, Any]] = []
+    for query in query_variants:
+        try:
+            collected.append(choose_best_commons_image(query, target_day_msk))
+        except NoImageForTargetDayError:
+            continue
+
+    if not collected:
+        raise NoImageForTargetDayError(
+            "commons: no image results for provided queries. "
+            "Try updating COMMONS_QUERY_VARIANTS or IMAGE_SEARCH_QUERY."
+        )
+
+    # Day-based rotation over available query results.
+    index = target_day_msk.toordinal() % len(collected)
+    return collected[index]
 
 
 def telegram_api_request(token: str, method: str, payload: dict[str, Any]) -> dict[str, Any]:
@@ -557,8 +657,8 @@ def send_to_telegram(
 def no_results_user_hint(details: str, *, has_oauth: bool, source_mode: str) -> str:
     if source_mode == "commons":
         return (
-            "По запросу в Wikimedia Commons не нашлось подходящего изображения (JPG/PNG/WebP). "
-            "Попробуйте изменить переменную IMAGE_SEARCH_QUERY."
+            "На выбранную дату не удалось подобрать картинку из Wikimedia Commons. "
+            "Попробуйте изменить переменную COMMONS_QUERY_VARIANTS."
         )
     if not has_oauth and ("403" in details or "Blocked" in details):
         return (
@@ -657,8 +757,11 @@ def main() -> int:
     best_item: dict[str, Any] | None = None
     try:
         if source_mode == "commons":
-            query = (os.getenv("IMAGE_SEARCH_QUERY") or "").strip() or DEFAULT_COMMONS_QUERY
-            best_item = choose_best_commons_image(query)
+            query_variants = parse_query_variants(os.getenv("COMMONS_QUERY_VARIANTS"))
+            best_item = choose_commons_image_for_day(
+                target_day_msk=target_day_msk,
+                query_variants=query_variants,
+            )
         else:
             best_item = choose_best_image(
                 subreddits=subreddits,

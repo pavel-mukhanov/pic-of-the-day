@@ -590,6 +590,15 @@ def fetch_midjourney_explore_markdown() -> str:
     return fetch_text(url)
 
 
+def midjourney_gif_url_from_webp(webp_url: str) -> str:
+    """Convert Midjourney CDN preview URL to GIF URL."""
+    if "?" in webp_url:
+        webp_url = webp_url.split("?", 1)[0]
+    if webp_url.endswith(".webp"):
+        return webp_url[: -len(".webp")] + ".gif"
+    return webp_url
+
+
 def parse_midjourney_candidates(markdown_text: str) -> list[dict[str, Any]]:
     candidates: list[dict[str, Any]] = []
     lines = markdown_text.splitlines()
@@ -614,12 +623,14 @@ def parse_midjourney_candidates(markdown_text: str) -> list[dict[str, Any]]:
             continue
         if not image_url.lower().endswith(".webp"):
             continue
+        gif_url = midjourney_gif_url_from_webp(image_url)
         rank_score = max(0, 10000 - len(candidates))
         candidates.append(
             {
                 "kind": "midjourney",
                 "title": "Midjourney video top",
-                "image_url": image_url,
+                "image_url": gif_url,
+                "preview_image_url": image_url,
                 "permalink": job_url,
                 "search_query": "midjourney explore video_top",
                 "is_animated": True,
@@ -674,6 +685,9 @@ def build_caption(item: dict[str, Any], target_day_msk: dt.date) -> str:
             "",
             item.get("title", "Midjourney video"),
         ]
+        if item.get("media_format"):
+            lines.append("")
+            lines.append(f"Формат: {item['media_format']}")
         if item.get("permalink"):
             lines.extend(["", item["permalink"]])
         return "\n".join(lines)
@@ -722,6 +736,8 @@ def send_to_telegram(
         return
 
     if item.get("is_animated"):
+        if not str(item.get("image_url", "")).lower().endswith(".gif"):
+            raise RuntimeError("Midjourney animated mode requires .gif URL.")
         try:
             telegram_api_request(
                 token=token,
@@ -767,7 +783,7 @@ def send_to_telegram(
 def no_results_user_hint(details: str, *, has_oauth: bool, source_mode: str) -> str:
     if source_mode == "midjourney":
         return (
-            "Не удалось получить гифки из Midjourney Explore через доступный прокси."
+            "Не удалось получить GIF из Midjourney Explore через доступный прокси."
             " Попробуйте позже или переключитесь на IMAGE_SOURCE=commons."
         )
     if source_mode == "commons":

@@ -590,6 +590,18 @@ def fetch_midjourney_explore_markdown() -> str:
     return fetch_text(url)
 
 
+def midjourney_media_url_from_webp(webp_url: str, extension: str) -> str:
+    """Convert Midjourney CDN preview URL to same basename with new extension."""
+    if "?" in webp_url:
+        webp_url = webp_url.split("?", 1)[0]
+    normalized_ext = extension.strip().lower().lstrip(".")
+    if not normalized_ext:
+        normalized_ext = "webm"
+    if webp_url.endswith(".webp"):
+        return f"{webp_url[: -len('.webp')]}.{normalized_ext}"
+    return webp_url
+
+
 def parse_midjourney_candidates(markdown_text: str) -> list[dict[str, Any]]:
     candidates: list[dict[str, Any]] = []
     lines = markdown_text.splitlines()
@@ -614,15 +626,20 @@ def parse_midjourney_candidates(markdown_text: str) -> list[dict[str, Any]]:
             continue
         if not image_url.lower().endswith(".webp"):
             continue
+        gif_url = midjourney_media_url_from_webp(image_url, "gif")
+        webm_url = midjourney_media_url_from_webp(image_url, "webm")
         rank_score = max(0, 10000 - len(candidates))
         candidates.append(
             {
                 "kind": "midjourney",
                 "title": "Midjourney video top",
-                "image_url": image_url,
+                "image_url": webm_url,
+                "fallback_gif_url": gif_url,
+                "preview_image_url": image_url,
                 "permalink": job_url,
                 "search_query": "midjourney explore video_top",
                 "is_animated": True,
+                "media_format": "webm",
                 "score": rank_score,
                 "created_utc": 0,
             }
@@ -669,11 +686,14 @@ def telegram_api_request(token: str, method: str, payload: dict[str, Any]) -> di
 def build_caption(item: dict[str, Any], target_day_msk: dt.date) -> str:
     if item.get("kind") == "midjourney":
         lines = [
-            f"GIF дня за {target_day_msk.strftime('%d.%m.%Y')} (МСК)",
+            f"Анимация дня за {target_day_msk.strftime('%d.%m.%Y')} (МСК)",
             "Источник: Midjourney Explore (video_top)",
             "",
             item.get("title", "Midjourney video"),
         ]
+        if item.get("media_format"):
+            lines.append("")
+            lines.append(f"Формат: {item['media_format']}")
         if item.get("permalink"):
             lines.extend(["", item["permalink"]])
         return "\n".join(lines)
@@ -722,20 +742,22 @@ def send_to_telegram(
         return
 
     if item.get("is_animated"):
+        media_url = item["image_url"]
         try:
             telegram_api_request(
                 token=token,
-                method="sendAnimation",
+                method="sendVideo",
                 payload={
                     "chat_id": chat_id,
-                    "animation": item["image_url"],
+                    "video": media_url,
                     "caption": caption[:1024],
+                    "supports_streaming": True,
                 },
             )
             return
         except Exception as error:  # noqa: BLE001
-            print(f"sendAnimation failed, fallback to sendMessage: {error}")
-            fallback_text = f"{caption}\n\n{item['image_url']}"
+            print(f"sendVideo failed: {error}")
+            fallback_text = f"{caption}\n\n{media_url}"
             telegram_api_request(
                 token=token,
                 method="sendMessage",
@@ -767,7 +789,7 @@ def send_to_telegram(
 def no_results_user_hint(details: str, *, has_oauth: bool, source_mode: str) -> str:
     if source_mode == "midjourney":
         return (
-            "Не удалось получить гифки из Midjourney Explore через доступный прокси."
+            "Не удалось получить GIF из Midjourney Explore через доступный прокси."
             " Попробуйте позже или переключитесь на IMAGE_SOURCE=commons."
         )
     if source_mode == "commons":

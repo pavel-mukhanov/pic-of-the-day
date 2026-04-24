@@ -590,12 +590,15 @@ def fetch_midjourney_explore_markdown() -> str:
     return fetch_text(url)
 
 
-def midjourney_gif_url_from_webp(webp_url: str) -> str:
-    """Convert Midjourney CDN preview URL to GIF URL."""
+def midjourney_media_url_from_webp(webp_url: str, extension: str) -> str:
+    """Convert Midjourney CDN preview URL to same basename with new extension."""
     if "?" in webp_url:
         webp_url = webp_url.split("?", 1)[0]
+    normalized_ext = extension.strip().lower().lstrip(".")
+    if not normalized_ext:
+        normalized_ext = "webm"
     if webp_url.endswith(".webp"):
-        return webp_url[: -len(".webp")] + ".gif"
+        return f"{webp_url[: -len('.webp')]}.{normalized_ext}"
     return webp_url
 
 
@@ -623,17 +626,20 @@ def parse_midjourney_candidates(markdown_text: str) -> list[dict[str, Any]]:
             continue
         if not image_url.lower().endswith(".webp"):
             continue
-        gif_url = midjourney_gif_url_from_webp(image_url)
+        gif_url = midjourney_media_url_from_webp(image_url, "gif")
+        webm_url = midjourney_media_url_from_webp(image_url, "webm")
         rank_score = max(0, 10000 - len(candidates))
         candidates.append(
             {
                 "kind": "midjourney",
                 "title": "Midjourney video top",
-                "image_url": gif_url,
+                "image_url": webm_url,
+                "fallback_gif_url": gif_url,
                 "preview_image_url": image_url,
                 "permalink": job_url,
                 "search_query": "midjourney explore video_top",
                 "is_animated": True,
+                "media_format": "webm",
                 "score": rank_score,
                 "created_utc": 0,
             }
@@ -680,7 +686,7 @@ def telegram_api_request(token: str, method: str, payload: dict[str, Any]) -> di
 def build_caption(item: dict[str, Any], target_day_msk: dt.date) -> str:
     if item.get("kind") == "midjourney":
         lines = [
-            f"GIF дня за {target_day_msk.strftime('%d.%m.%Y')} (МСК)",
+            f"Анимация дня за {target_day_msk.strftime('%d.%m.%Y')} (МСК)",
             "Источник: Midjourney Explore (video_top)",
             "",
             item.get("title", "Midjourney video"),
@@ -736,28 +742,33 @@ def send_to_telegram(
         return
 
     if item.get("is_animated"):
-        if not str(item.get("image_url", "")).lower().endswith(".gif"):
-            raise RuntimeError("Midjourney animated mode requires .gif URL.")
-        try:
-            telegram_api_request(
-                token=token,
-                method="sendAnimation",
-                payload={
-                    "chat_id": chat_id,
-                    "animation": item["image_url"],
-                    "caption": caption[:1024],
-                },
-            )
-            return
-        except Exception as error:  # noqa: BLE001
-            print(f"sendAnimation failed, fallback to sendMessage: {error}")
-            fallback_text = f"{caption}\n\n{item['image_url']}"
-            telegram_api_request(
-                token=token,
-                method="sendMessage",
-                payload={"chat_id": chat_id, "text": fallback_text},
-            )
-            return
+        media_url = item["image_url"]
+        media_format = str(item.get("media_format", "")).lower()
+        animation_methods = ["sendAnimation", "sendVideo"] if media_format == "gif" else ["sendVideo", "sendAnimation"]
+
+        for method in animation_methods:
+            try:
+                field = "animation" if method == "sendAnimation" else "video"
+                telegram_api_request(
+                    token=token,
+                    method=method,
+                    payload={
+                        "chat_id": chat_id,
+                        field: media_url,
+                        "caption": caption[:1024],
+                    },
+                )
+                return
+            except Exception as error:  # noqa: BLE001
+                print(f"{method} failed: {error}")
+
+        fallback_text = f"{caption}\n\n{media_url}"
+        telegram_api_request(
+            token=token,
+            method="sendMessage",
+            payload={"chat_id": chat_id, "text": fallback_text},
+        )
+        return
 
     try:
         telegram_api_request(

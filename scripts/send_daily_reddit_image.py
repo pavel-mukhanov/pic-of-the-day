@@ -600,6 +600,13 @@ def fetch_midjourney_explore_markdown() -> str:
     return fetch_text(url)
 
 
+def midjourney_proxy_url(url: str) -> str:
+    """Build proxy URL for links that are often blocked directly."""
+    if not isinstance(url, str) or not url.startswith("https://"):
+        return url
+    return "https://r.jina.ai/http://" + url.removeprefix("https://")
+
+
 def midjourney_media_url_from_webp(webp_url: str, extension: str) -> str:
     """Convert Midjourney CDN preview URL to same basename with new extension."""
     if "?" in webp_url:
@@ -840,7 +847,13 @@ def send_to_telegram(
             return
         except Exception as error:  # noqa: BLE001
             print(f"sendVideo(webm upload) failed: {error}")
-            fallback_text = f"{caption}\n\nGIF: {gif_url}\nWEBM: {webm_url}"
+            job_url = str(item.get("permalink") or "")
+            fallback_text = (
+                f"{caption}\n\n"
+                f"Job: {job_url}\n"
+                f"GIF (proxy): {midjourney_proxy_url(gif_url)}\n"
+                f"WEBM (proxy): {midjourney_proxy_url(webm_url)}"
+            )
             telegram_api_request(
                 token=token,
                 method="sendMessage",

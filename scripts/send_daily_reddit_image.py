@@ -743,32 +743,27 @@ def send_to_telegram(
 
     if item.get("is_animated"):
         media_url = item["image_url"]
-        media_format = str(item.get("media_format", "")).lower()
-        animation_methods = ["sendAnimation", "sendVideo"] if media_format == "gif" else ["sendVideo", "sendAnimation"]
-
-        for method in animation_methods:
-            try:
-                field = "animation" if method == "sendAnimation" else "video"
-                telegram_api_request(
-                    token=token,
-                    method=method,
-                    payload={
-                        "chat_id": chat_id,
-                        field: media_url,
-                        "caption": caption[:1024],
-                    },
-                )
-                return
-            except Exception as error:  # noqa: BLE001
-                print(f"{method} failed: {error}")
-
-        fallback_text = f"{caption}\n\n{media_url}"
-        telegram_api_request(
-            token=token,
-            method="sendMessage",
-            payload={"chat_id": chat_id, "text": fallback_text},
-        )
-        return
+        try:
+            telegram_api_request(
+                token=token,
+                method="sendVideo",
+                payload={
+                    "chat_id": chat_id,
+                    "video": media_url,
+                    "caption": caption[:1024],
+                    "supports_streaming": True,
+                },
+            )
+            return
+        except Exception as error:  # noqa: BLE001
+            print(f"sendVideo failed: {error}")
+            fallback_text = f"{caption}\n\n{media_url}"
+            telegram_api_request(
+                token=token,
+                method="sendMessage",
+                payload={"chat_id": chat_id, "text": fallback_text},
+            )
+            return
 
     try:
         telegram_api_request(

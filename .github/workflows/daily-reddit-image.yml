@@ -24,6 +24,7 @@ jobs:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
           # Source is controlled from environment variables in `news-agent`.
+          # Available: commons | midjourney | reddit
           IMAGE_SOURCE: ${{ vars.IMAGE_SOURCE || 'commons' }}
           IMAGE_SEARCH_QUERY: ${{ vars.IMAGE_SEARCH_QUERY || 'vaporwave aesthetic photography' }}
           COMMONS_QUERY_VARIANTS: ${{ vars.COMMONS_QUERY_VARIANTS }}

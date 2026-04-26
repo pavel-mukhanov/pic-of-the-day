@@ -93,6 +93,16 @@ def fetch_json(
         return json.load(response)
 
 
+def fetch_binary(url: str, *, headers: dict[str, str] | None = None) -> tuple[bytes, str]:
+    request_headers = {"User-Agent": HTTP_USER_AGENT}
+    if headers:
+        request_headers.update(headers)
+    request = urllib.request.Request(url, headers=request_headers, method="GET")
+    with urllib.request.urlopen(request, timeout=30) as response:
+        content_type = response.headers.get("Content-Type", "application/octet-stream")
+        return response.read(), content_type
+
+
 def get_reddit_oauth_token(client_id: str, client_secret: str) -> str:
     encoded_credentials = base64.b64encode(f"{client_id}:{client_secret}".encode("utf-8")).decode(
         "ascii"
@@ -590,6 +600,13 @@ def fetch_midjourney_explore_markdown() -> str:
     return fetch_text(url)
 
 
+def midjourney_proxy_url(url: str) -> str:
+    """Build proxy URL for links that are often blocked directly."""
+    if not isinstance(url, str) or not url.startswith("https://"):
+        return url
+    return "https://r.jina.ai/http://" + url.removeprefix("https://")
+
+
 def midjourney_media_url_from_webp(webp_url: str, extension: str) -> str:
     """Convert Midjourney CDN preview URL to same basename with new extension."""
     if "?" in webp_url:
@@ -633,13 +650,14 @@ def parse_midjourney_candidates(markdown_text: str) -> list[dict[str, Any]]:
             {
                 "kind": "midjourney",
                 "title": "Midjourney video top",
-                "image_url": webm_url,
-                "fallback_gif_url": gif_url,
+                "image_url": gif_url,
+                "primary_gif_url": gif_url,
+                "fallback_webm_url": webm_url,
                 "preview_image_url": image_url,
                 "permalink": job_url,
                 "search_query": "midjourney explore video_top",
                 "is_animated": True,
-                "media_format": "webm",
+                "media_format": "gif→webm",
                 "score": rank_score,
                 "created_utc": 0,
             }
@@ -676,6 +694,51 @@ def telegram_api_request(token: str, method: str, payload: dict[str, Any]) -> di
         method="POST",
     )
     with urllib.request.urlopen(request, timeout=30) as response:
+        result = json.load(response)
+
+    if not result.get("ok"):
+        raise RuntimeError(f"Telegram API error: {result}")
+    return result
+
+
+def telegram_api_request_multipart(
+    token: str,
+    method: str,
+    fields: dict[str, Any],
+    file_field: str,
+    filename: str,
+    file_bytes: bytes,
+    mime_type: str,
+) -> dict[str, Any]:
+    boundary = f"----picofday{int(dt.datetime.now().timestamp() * 1000)}"
+    body = bytearray()
+
+    for key, value in fields.items():
+        body.extend(f"--{boundary}\r\n".encode("utf-8"))
+        body.extend(f'Content-Disposition: form-data; name="{key}"\r\n\r\n'.encode("utf-8"))
+        body.extend(str(value).encode("utf-8"))
+        body.extend(b"\r\n")
+
+    body.extend(f"--{boundary}\r\n".encode("utf-8"))
+    body.extend(
+        (
+            f'Content-Disposition: form-data; name="{file_field}"; '
+            f'filename="{filename}"\r\n'
+        ).encode("utf-8")
+    )
+    body.extend(f"Content-Type: {mime_type}\r\n\r\n".encode("utf-8"))
+    body.extend(file_bytes)
+    body.extend(b"\r\n")
+    body.extend(f"--{boundary}--\r\n".encode("utf-8"))
+
+    url = f"https://api.telegram.org/bot{token}/{method}"
+    request = urllib.request.Request(
+        url,
+        data=bytes(body),
+        headers={"Content-Type": f"multipart/form-data; boundary={boundary}"},
+        method="POST",
+    )
+    with urllib.request.urlopen(request, timeout=60) as response:
         result = json.load(response)
 
     if not result.get("ok"):
@@ -742,22 +805,55 @@ def send_to_telegram(
         return
 
     if item.get("is_animated"):
-        media_url = item["image_url"]
+        gif_url = str(item.get("primary_gif_url") or item.get("image_url") or "")
+        webm_url = str(item.get("fallback_webm_url") or "")
         try:
-            telegram_api_request(
+            if not gif_url:
+                raise RuntimeError("GIF URL is missing.")
+            gif_bytes, gif_mime = fetch_binary(gif_url)
+            telegram_api_request_multipart(
                 token=token,
-                method="sendVideo",
-                payload={
+                method="sendAnimation",
+                fields={
                     "chat_id": chat_id,
-                    "video": media_url,
                     "caption": caption[:1024],
-                    "supports_streaming": True,
                 },
+                file_field="animation",
+                filename="midjourney.gif",
+                file_bytes=gif_bytes,
+                mime_type=gif_mime,
             )
             return
         except Exception as error:  # noqa: BLE001
-            print(f"sendVideo failed: {error}")
-            fallback_text = f"{caption}\n\n{media_url}"
+            print(f"sendAnimation(gif upload) failed: {error}")
+
+        try:
+            if not webm_url:
+                raise RuntimeError("WEBM URL is missing.")
+            webm_bytes, webm_mime = fetch_binary(webm_url)
+            telegram_api_request_multipart(
+                token=token,
+                method="sendVideo",
+                fields={
+                    "chat_id": chat_id,
+                    "caption": caption[:1024],
+                    "supports_streaming": True,
+                },
+                file_field="video",
+                filename="midjourney.webm",
+                file_bytes=webm_bytes,
+                mime_type=webm_mime,
+            )
+            return
+        except Exception as error:  # noqa: BLE001
+            print(f"sendVideo(webm upload) failed: {error}")
+            job_url = str(item.get("permalink") or "")
+            fallback_text = (
+                f"{caption}\n\n"
+                f"Job: {job_url}\n"
+                f"GIF (proxy): {midjourney_proxy_url(gif_url)}\n"
+                f"WEBM (proxy): {midjourney_proxy_url(webm_url)}"
+            )
             telegram_api_request(
                 token=token,
                 method="sendMessage",
